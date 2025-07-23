@@ -11,3 +11,11 @@ m=audio 5006 RTP/AVP 97
 a=rtpmap:97 opus/48000/2
 a=fmtp:97 maxplaybackrate=48000;stereo=1;useinbandfec=1
 a=sendonly
+m=video 5008 RTP/AVP 96
+a=rtpmap:96 VP8/90000
+a=fmtp:96 max-fr=30;max-fs=8040
+a=sendonly
+m=audio 5010 RTP/AVP 97
+a=rtpmap:97 opus/48000/2
+a=fmtp:97 maxplaybackrate=48000;stereo=1;useinbandfec=1
+a=sendonly

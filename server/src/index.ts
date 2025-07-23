@@ -25,8 +25,8 @@ const io = new Server(httpServer, {
 
 let worker: types.Worker;
 let router: types.Router;
-let videoRtpTransport: types.PlainTransport | null = null;
-let audioRtpTransport: types.PlainTransport | null = null;
+let videoRtpTransports: types.PlainTransport[] = [];
+let audioRtpTransports: types.PlainTransport[] = [];
 let ffmpegProcess: any = null;
 
 const startMediasoup = async () => {
@@ -46,6 +46,81 @@ const startMediasoup = async () => {
     mediaCodecs: config.mediasoup.router.mediaCodecs,
   });
   console.info("Mediasoup router created");
+
+  // Initialize RTP transports for the fixed ports in SDP
+  await initializeRtpTransports();
+};
+
+const initializeRtpTransports = async () => {
+  try {
+    // Create video RTP transport for port 5004 (first video stream)
+    const videoTransport1 = await router.createPlainTransport({
+      listenIp: config.rtpPlayer.listenIp,
+      rtcpMux: false,
+      comedia: false,
+    });
+    await videoTransport1.connect({
+      ip: config.rtpPlayer.listenIp,
+      port: config.rtpPlayer.videoPort, // 5004
+      rtcpPort: config.rtpPlayer.videoPort + 1, // 5005
+    });
+    videoRtpTransports.push(videoTransport1);
+    console.log(
+      `Video RTP transport 1 connected on port ${config.rtpPlayer.videoPort}`
+    );
+
+    // Create video RTP transport for port 5008 (second video stream)
+    const videoTransport2 = await router.createPlainTransport({
+      listenIp: config.rtpPlayer.listenIp,
+      rtcpMux: false,
+      comedia: false,
+    });
+    await videoTransport2.connect({
+      ip: config.rtpPlayer.listenIp,
+      port: config.rtpPlayer.videoPort2, // 5008
+      rtcpPort: config.rtpPlayer.videoPort2 + 1, // 5009
+    });
+    videoRtpTransports.push(videoTransport2);
+    console.log(
+      `Video RTP transport 2 connected on port ${config.rtpPlayer.videoPort2}`
+    );
+
+    // Create audio RTP transport for port 5006 (first audio stream)
+    const audioTransport1 = await router.createPlainTransport({
+      listenIp: config.rtpPlayer.listenIp,
+      rtcpMux: false,
+      comedia: false,
+    });
+    await audioTransport1.connect({
+      ip: config.rtpPlayer.listenIp,
+      port: config.rtpPlayer.audioPort, // 5006
+      rtcpPort: config.rtpPlayer.audioPort + 1, // 5007
+    });
+    audioRtpTransports.push(audioTransport1);
+    console.log(
+      `Audio RTP transport 1 connected on port ${config.rtpPlayer.audioPort}`
+    );
+
+    // Create audio RTP transport for port 5010 (second audio stream)
+    const audioTransport2 = await router.createPlainTransport({
+      listenIp: config.rtpPlayer.listenIp,
+      rtcpMux: false,
+      comedia: false,
+    });
+    await audioTransport2.connect({
+      ip: config.rtpPlayer.listenIp,
+      port: config.rtpPlayer.audioPort2, // 5010
+      rtcpPort: config.rtpPlayer.audioPort2 + 1, // 5011
+    });
+    audioRtpTransports.push(audioTransport2);
+    console.log(
+      `Audio RTP transport 2 connected on port ${config.rtpPlayer.audioPort2}`
+    );
+
+    console.log("All RTP transports initialized successfully");
+  } catch (error) {
+    console.error("Failed to initialize RTP transports:", error);
+  }
 };
 
 startMediasoup();
@@ -88,7 +163,7 @@ io.on("connection", (socket) => {
 
   // 1. Client asks for Router's capabilities
   socket.on("getRouterRtpCapabilities", (callback) => {
-    callback(router.rtpCapabilities);
+    callback(router?.rtpCapabilities);
   });
 
   // 2. Client asks to create a transport
@@ -162,11 +237,14 @@ io.on("connection", (socket) => {
 
       peer.producers.set(producer.id, producer);
 
-      // Start RTP broadcast when we have our first producer
-      await setupRtpStreaming();
+      // Start FFmpeg when we have two peers and it's not already running
+      if (peers.size === 2 && !ffmpegProcess) {
+        console.log("Two peers detected, starting FFmpeg process...");
+        startFFmpegProcess();
+      }
 
       // Create RTP consumer for this producer
-      await createRtpConsumer(producer);
+      await createRtpConsumer(producer, socket.id);
 
       // Inform all other clients that a new producer is available
       socket.broadcast.emit("new-producer", {
@@ -197,62 +275,39 @@ io.on("connection", (socket) => {
     }
   );
 
-  const setupRtpStreaming = async () => {
+  // Track producer assignments to ensure proper stream ordering
+  const producerAssignments = new Map<string, number>(); // producerId -> transportIndex
+
+  const createRtpConsumer = async (
+    producer: types.Producer,
+    peerSocketId: string
+  ) => {
     try {
-      // Create video RTP transport if it doesn't exist
-      if (!videoRtpTransport) {
-        videoRtpTransport = await router.createPlainTransport({
-          listenIp: config.rtpPlayer.listenIp,
-          rtcpMux: false,
-          comedia: false,
-        });
+      // Determine transport index based on peer order (0 for first peer, 1 for second peer)
+      const peerIds = Array.from(peers.keys());
+      const peerIndex = peerIds.indexOf(peerSocketId);
 
-        await videoRtpTransport.connect({
-          ip: config.rtpPlayer.listenIp,
-          port: config.rtpPlayer.videoPort,
-          rtcpPort: config.rtpPlayer.videoPort + 1,
-        });
-        console.log(
-          `Video RTP transport connected on port ${config.rtpPlayer.videoPort}`
+      if (peerIndex === -1 || peerIndex > 1) {
+        console.error(
+          `Invalid peer index ${peerIndex} for peer ${peerSocketId}`
         );
-      }
-
-      // Create audio RTP transport if it doesn't exist
-      if (!audioRtpTransport) {
-        audioRtpTransport = await router.createPlainTransport({
-          listenIp: config.rtpPlayer.listenIp,
-          rtcpMux: false,
-          comedia: false,
-        });
-
-        await audioRtpTransport.connect({
-          ip: config.rtpPlayer.listenIp,
-          port: config.rtpPlayer.audioPort,
-          rtcpPort: config.rtpPlayer.audioPort + 1,
-        });
-        console.log(
-          `Audio RTP transport connected on port ${config.rtpPlayer.audioPort}`
-        );
-      }
-
-      // Start FFmpeg process if not already running
-      if (!ffmpegProcess) {
-        startFFmpegProcess();
-      }
-    } catch (error) {
-      console.error("Failed to setup RTP streaming:", error);
-    }
-  };
-
-  const createRtpConsumer = async (producer: types.Producer) => {
-    try {
-      const rtpTransport =
-        producer.kind === "video" ? videoRtpTransport : audioRtpTransport;
-
-      if (!rtpTransport) {
-        console.error(`No RTP transport available for ${producer.kind}`);
         return;
       }
+
+      const transportIndex = peerIndex; // 0 for first peer, 1 for second peer
+      const rtpTransports =
+        producer.kind === "video" ? videoRtpTransports : audioRtpTransports;
+      const rtpTransport = rtpTransports[transportIndex];
+
+      if (!rtpTransport) {
+        console.error(
+          `No RTP transport available for ${producer.kind} at index ${transportIndex}`
+        );
+        return;
+      }
+
+      // Store the assignment for tracking
+      producerAssignments.set(producer.id, transportIndex);
 
       // Use router's RTP capabilities as-is, without modification
       const consumer = await rtpTransport.consume({
@@ -260,20 +315,30 @@ io.on("connection", (socket) => {
         rtpCapabilities: router.rtpCapabilities,
       });
 
+      const ports =
+        producer.kind === "video"
+          ? [config.rtpPlayer.videoPort, config.rtpPlayer.videoPort2]
+          : [config.rtpPlayer.audioPort, config.rtpPlayer.audioPort2];
+
       console.log(`Created RTP consumer for ${producer.kind}:`, {
         producerId: producer.id,
         consumerId: consumer.id,
+        peerIndex: peerIndex,
+        transportIndex: transportIndex,
+        port: ports[transportIndex],
         payloadType: consumer.rtpParameters.codecs[0]?.payloadType,
       });
 
       consumer.on("transportclose", () => {
         console.log(`RTP consumer closed for ${producer.kind}`);
+        producerAssignments.delete(producer.id);
       });
 
       consumer.on("producerclose", () => {
         console.log(
           `RTP consumer closed due to producer close for ${producer.kind}`
         );
+        producerAssignments.delete(producer.id);
       });
     } catch (error) {
       console.error(
@@ -296,6 +361,7 @@ io.on("connection", (socket) => {
     const ffmpegArgs = [
       "-protocol_whitelist",
       "file,udp,rtp",
+      // FFmpeg flags for better RTP handling
       "-fflags",
       "+genpts",
       "-analyzeduration",
@@ -306,12 +372,18 @@ io.on("connection", (socket) => {
       "500000",
       "-buffer_size",
       "65536",
+      // Input
       "-i",
-      "./stream.sdp", // Fixed path - relative to current working directory
+      "./stream.sdp",
+      // Filter complex: scale both videos and combine side by side, merge audio
+      "-filter_complex",
+      "[0:0]scale=960:720[v0]; [0:2]scale=960:720[v1]; [v0][v1]hstack=inputs=2[v]; [0:1][0:3]amerge=inputs=2[a]",
+      // Mapping - map the filter outputs
       "-map",
-      "0:v?", // ? makes it optional
+      "[v]",
       "-map",
-      "0:a?", // ? makes it optional
+      "[a]",
+      // Video codec settings
       "-c:v",
       "libx264",
       "-preset",
@@ -320,12 +392,20 @@ io.on("connection", (socket) => {
       "zerolatency",
       "-pix_fmt",
       "yuv420p",
+      "-g",
+      "30", // GOP size for better seeking
+      "-sc_threshold",
+      "0", // Disable scene change detection
+      // Audio codec settings
       "-c:a",
       "aac",
       "-ar",
       "44100",
       "-ac",
       "2",
+      "-b:a",
+      "128k",
+      // HLS settings
       "-f",
       "hls",
       "-hls_time",
@@ -336,7 +416,9 @@ io.on("connection", (socket) => {
       "delete_segments+append_list",
       "-hls_allow_cache",
       "0",
-      path.resolve(outputDir, "stream.m3u8"), // Use absolute path
+      "-hls_segment_type",
+      "mpegts",
+      path.resolve(outputDir, "stream.m3u8"),
     ];
 
     ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {

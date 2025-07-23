@@ -7,6 +7,8 @@ export const config = {
     listenIp: "127.0.0.1",
     videoPort: 5004,
     audioPort: 5006,
+    videoPort2: 5008,
+    audioPort2: 5010,
   },
   mediasoup: {
     worker: {
