@@ -22,11 +22,13 @@ export const config = {
           mimeType: "audio/opus",
           clockRate: 48000,
           channels: 2,
+          preferredPayloadType: 97,
         },
         {
           kind: "video",
           mimeType: "video/VP8",
           clockRate: 90000,
+          preferredPayloadType: 96,
           parameters: {
             "x-google-start-bitrate": 1000,
           },

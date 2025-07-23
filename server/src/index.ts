@@ -5,6 +5,8 @@ import * as mediasoup from "mediasoup";
 import type { types } from "mediasoup";
 import { config } from "./config";
 import { spawn } from "child_process";
+import { existsSync, mkdirSync } from "fs";
+import path from "path";
 
 type Peer = {
   transports: Map<string, types.WebRtcTransport>;
@@ -23,7 +25,9 @@ const io = new Server(httpServer, {
 
 let worker: types.Worker;
 let router: types.Router;
-let rtpTransport: types.PlainTransport | null = null;
+let videoRtpTransport: types.PlainTransport | null = null;
+let audioRtpTransport: types.PlainTransport | null = null;
+let ffmpegProcess: any = null;
 
 const startMediasoup = async () => {
   worker = await mediasoup.createWorker({
@@ -159,44 +163,10 @@ io.on("connection", (socket) => {
       peer.producers.set(producer.id, producer);
 
       // Start RTP broadcast when we have our first producer
-      if (!rtpTransport) {
-        await startRtpBroadcast();
-      }
+      await setupRtpStreaming();
 
-      // Consume this new producer with our RTP transport
-      if (rtpTransport) {
-        try {
-          // For RTP transport, we need to specify the right payload type
-          const rtpCapabilities = {
-            ...router.rtpCapabilities,
-            codecs:
-              router.rtpCapabilities.codecs?.map((codec) => {
-                if (codec.kind === kind) {
-                  // Map to the payload types we defined in SDP
-                  if (kind === "video" && codec.mimeType === "video/VP8") {
-                    return { ...codec, preferredPayloadType: 101 };
-                  } else if (
-                    kind === "audio" &&
-                    codec.mimeType === "audio/opus"
-                  ) {
-                    return { ...codec, preferredPayloadType: 100 };
-                  }
-                }
-                return codec;
-              }) || [],
-          };
-
-          console.log("rtpCapabilities", rtpCapabilities);
-          const consumer = await rtpTransport.consume({
-            producerId: producer.id,
-            rtpCapabilities,
-          });
-
-          console.log(`Consumer RTP parameters:`, consumer.rtpParameters);
-        } catch (error) {
-          console.error(`Failed to create RTP consumer for ${kind}:`, error);
-        }
-      }
+      // Create RTP consumer for this producer
+      await createRtpConsumer(producer);
 
       // Inform all other clients that a new producer is available
       socket.broadcast.emit("new-producer", {
@@ -227,94 +197,169 @@ io.on("connection", (socket) => {
     }
   );
 
-  const startRtpBroadcast = async () => {
+  const setupRtpStreaming = async () => {
     try {
-      // Skip if RTP transport already exists
-      if (rtpTransport) {
+      // Create video RTP transport if it doesn't exist
+      if (!videoRtpTransport) {
+        videoRtpTransport = await router.createPlainTransport({
+          listenIp: config.rtpPlayer.listenIp,
+          rtcpMux: false,
+          comedia: false,
+        });
+
+        await videoRtpTransport.connect({
+          ip: config.rtpPlayer.listenIp,
+          port: config.rtpPlayer.videoPort,
+          rtcpPort: config.rtpPlayer.videoPort + 1,
+        });
+        console.log(
+          `Video RTP transport connected on port ${config.rtpPlayer.videoPort}`
+        );
+      }
+
+      // Create audio RTP transport if it doesn't exist
+      if (!audioRtpTransport) {
+        audioRtpTransport = await router.createPlainTransport({
+          listenIp: config.rtpPlayer.listenIp,
+          rtcpMux: false,
+          comedia: false,
+        });
+
+        await audioRtpTransport.connect({
+          ip: config.rtpPlayer.listenIp,
+          port: config.rtpPlayer.audioPort,
+          rtcpPort: config.rtpPlayer.audioPort + 1,
+        });
+        console.log(
+          `Audio RTP transport connected on port ${config.rtpPlayer.audioPort}`
+        );
+      }
+
+      // Start FFmpeg process if not already running
+      if (!ffmpegProcess) {
+        startFFmpegProcess();
+      }
+    } catch (error) {
+      console.error("Failed to setup RTP streaming:", error);
+    }
+  };
+
+  const createRtpConsumer = async (producer: types.Producer) => {
+    try {
+      const rtpTransport =
+        producer.kind === "video" ? videoRtpTransport : audioRtpTransport;
+
+      if (!rtpTransport) {
+        console.error(`No RTP transport available for ${producer.kind}`);
         return;
       }
 
-      // Create a PlainTransport for RTP forwarding
-      rtpTransport = await router.createPlainTransport({
-        listenIp: config.rtpPlayer.listenIp,
-        rtcpMux: false,
-        comedia: false,
+      // Use router's RTP capabilities as-is, without modification
+      const consumer = await rtpTransport.consume({
+        producerId: producer.id,
+        rtpCapabilities: router.rtpCapabilities,
       });
 
-      console.log("RTP transport created for HLS broadcast");
-
-      // Connect to specific video port (FFmpeg will read from this)
-      const videoPort = config.rtpPlayer.videoPort;
-
-      await rtpTransport.connect({
-        ip: config.rtpPlayer.listenIp,
-        port: videoPort,
-        rtcpPort: videoPort + 1,
-      });
-      console.log(`RTP transport connected on port ${videoPort}`);
-
-      // This is where you would start the ffmpeg process
-      console.info("Starting FFMpeg process...");
-
-      const ffmpegArgs = [
-        "-protocol_whitelist",
-        "file,udp,rtp",
-        "-fflags",
-        "+genpts",
-        "-analyzeduration",
-        "10000000",
-        "-probesize",
-        "10000000",
-        "-i",
-        "src/stream.sdp",
-        "-map",
-        "0:v",
-        "-map",
-        "0:a",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-tune",
-        "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-ar",
-        "44100",
-        "-ac",
-        "2",
-        "-f",
-        "hls",
-        "-hls_time",
-        "2",
-        "-hls_list_size",
-        "5",
-        "-hls_flags",
-        "delete_segments+append_list",
-        "-hls_allow_cache",
-        "0",
-        "../fermion-app/public/live/stream.m3u8",
-      ];
-
-      const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
-
-      ffmpegProcess.stdout.on("data", (data) => {
-        // You can log FFMpeg's output for debugging
-        console.log(`ffmpeg stdout: ${data}`);
+      console.log(`Created RTP consumer for ${producer.kind}:`, {
+        producerId: producer.id,
+        consumerId: consumer.id,
+        payloadType: consumer.rtpParameters.codecs[0]?.payloadType,
       });
 
-      ffmpegProcess.stderr.on("data", (data) => {
-        console.error(`ffmpeg stderr: ${data}`);
+      consumer.on("transportclose", () => {
+        console.log(`RTP consumer closed for ${producer.kind}`);
       });
 
-      ffmpegProcess.on("close", (code) => {
-        console.error(`ffmpeg process exited with code ${code}`);
+      consumer.on("producerclose", () => {
+        console.log(
+          `RTP consumer closed due to producer close for ${producer.kind}`
+        );
       });
     } catch (error) {
-      console.error("Failed to start RTP broadcast:", error);
+      console.error(
+        `Failed to create RTP consumer for ${producer.kind}:`,
+        error
+      );
     }
+  };
+
+  const startFFmpegProcess = () => {
+    console.info("Starting FFmpeg process...");
+
+    // Ensure output directory exists
+    const outputDir = path.resolve(__dirname, "../../fermion-app/public/live");
+    if (!existsSync(outputDir)) {
+      mkdirSync(outputDir, { recursive: true });
+      console.log(`Created output directory: ${outputDir}`);
+    }
+
+    const ffmpegArgs = [
+      "-protocol_whitelist",
+      "file,udp,rtp",
+      "-fflags",
+      "+genpts",
+      "-analyzeduration",
+      "3000000",
+      "-probesize",
+      "3000000",
+      "-max_delay",
+      "500000",
+      "-buffer_size",
+      "65536",
+      "-i",
+      "./stream.sdp", // Fixed path - relative to current working directory
+      "-map",
+      "0:v?", // ? makes it optional
+      "-map",
+      "0:a?", // ? makes it optional
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-tune",
+      "zerolatency",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-ar",
+      "44100",
+      "-ac",
+      "2",
+      "-f",
+      "hls",
+      "-hls_time",
+      "2",
+      "-hls_list_size",
+      "5",
+      "-hls_flags",
+      "delete_segments+append_list",
+      "-hls_allow_cache",
+      "0",
+      path.resolve(outputDir, "stream.m3u8"), // Use absolute path
+    ];
+
+    ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
+      cwd: "src", // Set working directory to src so stream.sdp path works
+    });
+
+    ffmpegProcess.stdout.on("data", (data: Buffer) => {
+      console.log(`ffmpeg stdout: ${data.toString()}`);
+    });
+
+    ffmpegProcess.stderr.on("data", (data: Buffer) => {
+      console.log(`ffmpeg stderr: ${data.toString()}`);
+    });
+
+    ffmpegProcess.on("close", (code: number) => {
+      console.log(`ffmpeg process exited with code ${code}`);
+      ffmpegProcess = null;
+    });
+
+    ffmpegProcess.on("error", (error: Error) => {
+      console.error("FFmpeg process error:", error);
+      ffmpegProcess = null;
+    });
   };
 
   // 5. Client wants to consume (receive) media
