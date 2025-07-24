@@ -1,3 +1,7 @@
+### Fix
+
+- hls stream complexing
+
 # Setup
 
 - Prequesites: have nodejs, ffmpeg installed
