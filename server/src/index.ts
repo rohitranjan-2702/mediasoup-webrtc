@@ -19,7 +19,7 @@ const app = express();
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: "*", // local
+    origin: "*",
   },
 });
 
@@ -28,6 +28,102 @@ let router: types.Router;
 let videoRtpTransports: types.PlainTransport[] = [];
 let audioRtpTransports: types.PlainTransport[] = [];
 let ffmpegProcess: any = null;
+
+const startFFmpegProcess = () => {
+  console.info("Starting FFmpeg process...");
+
+  // Ensure output directory exists
+  const outputDir = path.resolve(__dirname, "../../fermion-app/public/live");
+  if (!existsSync(outputDir)) {
+    mkdirSync(outputDir, { recursive: true });
+    console.log(`Created output directory: ${outputDir}`);
+  }
+
+  const ffmpegArgs = [
+    "-protocol_whitelist",
+    "file,udp,rtp",
+    // FFmpeg flags for better RTP handling
+    "-fflags",
+    "+genpts+discardcorrupt+igndts",
+    "-analyzeduration",
+    "3000000",
+    "-probesize",
+    "3000000",
+    "-max_delay",
+    "500000",
+    "-buffer_size",
+    "65536",
+    // Input
+    "-i",
+    "./stream.sdp",
+    // Filter complex: scale both videos and combine side by side, merge audio
+    "-filter_complex",
+    "[0:0]setpts=PTS-STARTPTS,scale=320:240[v0]; [0:2]setpts=PTS-STARTPTS,scale=320:240[v1]; [v0][v1]hstack=inputs=2[v]; [0:1][0:3]amerge=inputs=2[a]",
+    // Mapping - map the filter outputs
+    "-map",
+    "[v]",
+    "-map",
+    "[a]",
+    // Video codec settings
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-tune",
+    "zerolatency",
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    "30", // GOP size for better seeking
+    "-sc_threshold",
+    "0", // Disable scene change detection
+    // Audio codec settings
+    "-c:a",
+    "aac",
+    "-ar",
+    "44100",
+    "-ac",
+    "2",
+    "-b:a",
+    "128k",
+    // HLS settings
+    "-f",
+    "hls",
+    "-hls_time",
+    "2",
+    "-hls_list_size",
+    "5",
+    "-hls_flags",
+    "append_list",
+    "-hls_allow_cache",
+    "0",
+    "-hls_segment_type",
+    "mpegts",
+    path.resolve(outputDir, "stream.m3u8"),
+  ];
+
+  ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
+    cwd: "src", // Set working directory to src so stream.sdp path works
+  });
+
+  ffmpegProcess.stdout.on("data", (data: Buffer) => {
+    console.log(`ffmpeg stdout: ${data.toString()}`);
+  });
+
+  ffmpegProcess.stderr.on("data", (data: Buffer) => {
+    console.log(`ffmpeg stderr: ${data.toString()}`);
+  });
+
+  ffmpegProcess.on("close", (code: number) => {
+    console.log(`ffmpeg process exited with code ${code}`);
+    ffmpegProcess = null;
+  });
+
+  ffmpegProcess.on("error", (error: Error) => {
+    console.error("FFmpeg process error:", error);
+    ffmpegProcess = null;
+  });
+};
 
 const startMediasoup = async () => {
   worker = await mediasoup.createWorker({
@@ -47,8 +143,11 @@ const startMediasoup = async () => {
   });
   console.info("Mediasoup router created");
 
-  // Initialize RTP transports for the fixed ports in SDP
   await initializeRtpTransports();
+
+  if(!ffmpegProcess) {
+    startFFmpegProcess();
+  }
 };
 
 const initializeRtpTransports = async () => {
@@ -203,7 +302,7 @@ io.on("connection", (socket) => {
   // 3. Client connects the transport
   socket.on(
     "connectWebRtcTransport",
-    async ({ transportId, dtlsParameters }, callback) => {
+    async ({ transportId, dtlsParameters }: { transportId: string; dtlsParameters: types.DtlsParameters }, callback) => {
       const peer = peers.get(socket.id);
       if (!peer) {
         console.error("Peer not found for connect:", socket.id);
@@ -222,7 +321,7 @@ io.on("connection", (socket) => {
   // 4. Client wants to produce (send) media
   socket.on(
     "produce",
-    async ({ transportId, kind, rtpParameters }, callback) => {
+    async ({ transportId, kind, rtpParameters }: { transportId: string; kind: string; rtpParameters: types.RtpParameters }, callback) => {
       const peer = peers.get(socket.id);
       if (!peer) {
         console.error("Peer not found for produce:", socket.id);
@@ -233,15 +332,9 @@ io.on("connection", (socket) => {
         console.error("Transport not found for produce:", transportId);
         return callback({ error: "Transport not found" });
       }
-      const producer = await transport.produce({ kind, rtpParameters });
+      const producer = await transport.produce({ kind: kind as types.MediaKind , rtpParameters });
 
       peer.producers.set(producer.id, producer);
-
-      // Start FFmpeg when we have two peers and it's not already running
-      if (peers.size === 2 && !ffmpegProcess) {
-        console.log("Two peers detected, starting FFmpeg process...");
-        startFFmpegProcess();
-      }
 
       // Create RTP consumer for this producer
       await createRtpConsumer(producer, socket.id);
@@ -348,106 +441,12 @@ io.on("connection", (socket) => {
     }
   };
 
-  const startFFmpegProcess = () => {
-    console.info("Starting FFmpeg process...");
-
-    // Ensure output directory exists
-    const outputDir = path.resolve(__dirname, "../../fermion-app/public/live");
-    if (!existsSync(outputDir)) {
-      mkdirSync(outputDir, { recursive: true });
-      console.log(`Created output directory: ${outputDir}`);
-    }
-
-    const ffmpegArgs = [
-      "-protocol_whitelist",
-      "file,udp,rtp",
-      // FFmpeg flags for better RTP handling
-      "-fflags",
-      "+genpts",
-      "-analyzeduration",
-      "3000000",
-      "-probesize",
-      "3000000",
-      "-max_delay",
-      "500000",
-      "-buffer_size",
-      "65536",
-      // Input
-      "-i",
-      "./stream.sdp",
-      // Filter complex: scale both videos and combine side by side, merge audio
-      "-filter_complex",
-      "[0:0]scale=960:720[v0]; [0:2]scale=960:720[v1]; [v0][v1]hstack=inputs=2[v]; [0:1][0:3]amerge=inputs=2[a]",
-      // Mapping - map the filter outputs
-      "-map",
-      "[v]",
-      "-map",
-      "[a]",
-      // Video codec settings
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-tune",
-      "zerolatency",
-      "-pix_fmt",
-      "yuv420p",
-      "-g",
-      "30", // GOP size for better seeking
-      "-sc_threshold",
-      "0", // Disable scene change detection
-      // Audio codec settings
-      "-c:a",
-      "aac",
-      "-ar",
-      "44100",
-      "-ac",
-      "2",
-      "-b:a",
-      "128k",
-      // HLS settings
-      "-f",
-      "hls",
-      "-hls_time",
-      "2",
-      "-hls_list_size",
-      "5",
-      "-hls_flags",
-      "delete_segments+append_list",
-      "-hls_allow_cache",
-      "0",
-      "-hls_segment_type",
-      "mpegts",
-      path.resolve(outputDir, "stream.m3u8"),
-    ];
-
-    ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
-      cwd: "src", // Set working directory to src so stream.sdp path works
-    });
-
-    ffmpegProcess.stdout.on("data", (data: Buffer) => {
-      console.log(`ffmpeg stdout: ${data.toString()}`);
-    });
-
-    ffmpegProcess.stderr.on("data", (data: Buffer) => {
-      console.log(`ffmpeg stderr: ${data.toString()}`);
-    });
-
-    ffmpegProcess.on("close", (code: number) => {
-      console.log(`ffmpeg process exited with code ${code}`);
-      ffmpegProcess = null;
-    });
-
-    ffmpegProcess.on("error", (error: Error) => {
-      console.error("FFmpeg process error:", error);
-      ffmpegProcess = null;
-    });
-  };
+  
 
   // 5. Client wants to consume (receive) media
   socket.on(
     "consume",
-    async ({ transportId, producerId, rtpCapabilities }, callback) => {
+    async ({ transportId, producerId, rtpCapabilities }: { transportId: string; producerId: string; rtpCapabilities: types.RtpCapabilities }, callback) => {
       const peer = peers.get(socket.id);
       if (!peer) {
         console.error("Peer not found for consume:", socket.id);

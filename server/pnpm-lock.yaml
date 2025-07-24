@@ -12,7 +12,7 @@ importers:
         specifier: ^4.21.2
         version: 4.21.2
       mediasoup:
-        specifier: ^3.16.7
+        specifier: '3'
         version: 3.16.7
       nodemon:
         specifier: ^3.1.9
