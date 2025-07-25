@@ -15,13 +15,6 @@ const HLS_CONFIG = {
 const RECOVERY_TIMEOUT = 2000;
 const FALLBACK_RECOVERY_TIMEOUT = 3000;
 
-// Types
-interface VideoState {
-  isLoading: boolean;
-  isPlaying: boolean;
-  isRecovering: boolean;
-  error: string | null;
-}
 
 // Custom hook for buffer recovery logic
 function useBufferRecovery(videoRef: React.RefObject<HTMLVideoElement | null>) {
