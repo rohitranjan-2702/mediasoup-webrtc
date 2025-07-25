@@ -1,3 +1,5 @@
+<img width="1269" height="651" alt="image" src="https://github.com/user-attachments/assets/0452eb4e-ce63-43f7-b685-2ba1467ebfca" />
+
 # Setup
 
 - Prequesites: have nodejs, ffmpeg installed
